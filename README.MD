@@ -84,23 +84,23 @@ uv run scrape_x.py --query "banjir aceh" --filter top
 
 ---
 
-## ⚠️ Security & Best Practices (Penting!)
+## ⚠️ Security & Best Practices
 
-Untuk menghindari deteksi bot dan menjaga keamanan akun Anda, harap ikuti panduan berikut saat menggunakan tool ini:
+To prevent bot detection and safeguard your account, please adhere to the following guidelines when using this tool:
 
-1. **Rekomendasi Browser & Keamanan Profil:**
-* Sangat direkomendasikan untuk menggunakan **Brave Browser** guna penyamaran dan pemrosesan yang lebih optimal.
-* Setelah Anda melakukan login ke Twitter/X via script/browser otomatis, *User Profile* dan sesi login Anda **hanya akan disimpan secara lokal di komputer Anda** dengan aman. Data kredensial tidak pernah dikirim ke server luar manapun.
-
-
-2. **Gunakan Akun Khusus (Akun Tumbal):**
-* **Jangan pernah gunakan akun utama Anda** untuk proses scraping.
-* Gunakan akun khusus *scraping* atau akun sekunder (akun tumbal). Jika sistem proteksi Twitter/X mendeteksi aktivitas mencurigakan dan melakukan *suspend*, akun utama Anda akan tetap aman.
+1. **Brave Browser Recommendation & Ad-Blocking:**
+* It is highly recommended to use **Brave Browser** as your browser executable. Brave's built-in ad-shield natively blocks promoted posts and advertisements, **preventing the script from accidentally scraping ads** as legitimate replies.
+* After logging into Twitter/X via the automated browser session, your user profile and active session cookies are **safely stored only on your local machine**. No credentials or data are ever transmitted to third-party servers.
 
 
-3. **Batasi Penggunaan Parameter Limit:**
-* Jangan menggunakan angka `--limit` yang terlalu tinggi dalam satu perintah agar tidak memicu proteksi anti-bot milik Twitter/X.
-* **Rekomendasi aman:** Batasi maksimal **40 replies/tweets per sesi**. Berikan jeda waktu (delay) sebelum menjalankan sesi berikutnya.
+2. **Use a Dedicated or Dummy Account:**
+* **Do not use your primary Twitter/X account** for scraping.
+* Always use a dedicated scraping/dummy account. If Twitter's automated systems flag the scraping behavior and suspend the account, your main account remains completely unaffected.
+
+
+3. **Keep Limit Parameters Low:**
+* Avoid using excessively high numbers for the `--limit` flag in a single run, as this mimics unnatural, bot-like activity.
+* **Recommended Limit:** Keep it to a maximum of **40 replies/tweets per session**, and introduce generous delay intervals between consecutive runs.
 
 
 
@@ -108,5 +108,5 @@ Untuk menghindari deteksi bot dan menjaga keamanan akun Anda, harap ikuti pandua
 
 ## 📝 Notes
 
-* **Placeholders:** Pastikan untuk mengganti contoh URL (`[https://x.com/username/](https://x.com/username/)...`) atau kata kunci pencarian (`"banjir aceh"`) dengan data riil yang ingin Anda ambil.
-* **Best Effort vs Reliable:** Flag `--reply-sort` pada URL tertentu bekerja secara *best-effort* karena keterbatasan algoritma X, sedangkan flag `--filter top` yang dipadukan dengan `--query` memiliki akurasi yang lebih andal.
+* **Placeholders:** Make sure to replace the example URL (`[https://x.com/username/](https://x.com/username/)...`) or query values (`"banjir aceh"`) with the actual data you want to scrape.
+* **Best Effort vs Reliable:** The `--reply-sort` flag for specific URLs operates on a *best-effort* basis due to X's dynamic layout, whereas the `--filter top` flag used alongside `--query` is highly reliable.
