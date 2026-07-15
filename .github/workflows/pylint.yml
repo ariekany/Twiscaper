@@ -17,7 +17,10 @@ jobs:
     - name: Install dependencies
       run: |
         curl -LsSf https://astral.sh/uv/install.sh | sh
+        uv venv
+        source .venv/bin/activate
         uv pip install pylint
     - name: Analysing the code with pylint
       run: |
+        source .venv/bin/activate
         pylint $(git ls-files '*.py')
