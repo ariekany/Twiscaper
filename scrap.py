@@ -18,9 +18,16 @@ jalankan agresif (limit besar, banyak query berturut-turut, dsb).
 Alternatif resmi: X API (berbayar, tapi tidak melanggar ToS).
 
 Cara pakai:
-    uv run scrape_x.py --query "teknologi" --limit 30
-    uv run scrape_x.py --query "from:username" --filter top --headless
-    uv run scrape_x.py --query "banjir jakarta" --limit 50 --json --stealth
+    # sekali jalan, berhenti setelah dapat 30 tweet
+    uv run scrape_x.py --query "teknologi" --limit 30 --once
+
+    # mode kontinu (default): scrape 30, jeda acak, scrape 30 baru lagi, dst,
+    # sampai dihentikan manual dengan Ctrl+C. Data terus ditambahkan (append)
+    # ke file CSV yang sama, tidak menghapus data lama - aman dijalankan ulang.
+    uv run scrape_x.py --url "https://x.com/username/status/123..." --limit 30 --reply-sort top
+
+    # ganti target? Ctrl+C dulu untuk stop, baru jalankan lagi dengan --url/--query baru
+    uv run scrape_x.py --query "banjir aceh" --filter top --limit 20 --cycle-pause-min 90 --cycle-pause-max 240
 """
 
 import argparse
@@ -72,6 +79,10 @@ class ScraperConfig:
     stealth: bool = False
     tweet_url: Optional[str] = None      # kalau diisi, --query diabaikan
     reply_sort: Optional[str] = None     # "top" | "latest" | "liked" | None (best-effort, UI dropdown)
+    once: bool = False                   # True = 1 siklus lalu keluar (perilaku lama)
+    cycle_pause_min: float = 180.0       # jeda minimum antar siklus, detik (default 3 menit)
+    cycle_pause_max: float = 420.0       # jeda maksimum antar siklus, detik (default 7 menit)
+    max_cycles: int = 0                  # 0 = tanpa batas, jalan terus sampai Ctrl+C
 
 
 CSV_FIELDS = [
@@ -144,15 +155,34 @@ def parse_metrics_from_aria(aria_label: str) -> dict:
     return metrics
 
 
+def load_existing_ids(path: str) -> set:
+    """Baca id yang sudah pernah tersimpan (dari sesi-sesi sebelumnya) supaya
+    tidak menimpa/menduplikasi data lama."""
+    ids = set()
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        try:
+            with open(path, "r", encoding="utf-8-sig", newline="") as f:
+                for row in csv.DictReader(f):
+                    if row.get("id"):
+                        ids.add(row["id"])
+        except Exception as e:
+            log.warning(f"[!] Gagal membaca data lama dari {path}: {e}")
+    return ids
+
+
 class IncrementalCsvWriter:
-    """Nulis CSV baris-per-baris & flush terus, jadi kalau proses crash/dihentikan
-    di tengah jalan, data yang sudah diambil tidak hilang."""
+    """Nulis CSV baris-per-baris & flush terus (append, bukan menimpa), jadi:
+    - kalau proses crash/dihentikan di tengah jalan, data yang sudah diambil tidak hilang.
+    - sesi baru (misalnya setelah Ctrl+C lalu jalan lagi) menyambung ke file yang sama,
+      tidak menghapus data lama."""
 
     def __init__(self, path: str, fieldnames: list):
-        self._file = open(path, "w", newline="", encoding="utf-8-sig")
+        file_has_data = os.path.exists(path) and os.path.getsize(path) > 0
+        self._file = open(path, "a", newline="", encoding="utf-8-sig")
         self._writer = csv.DictWriter(self._file, fieldnames=fieldnames)
-        self._writer.writeheader()
-        self._file.flush()
+        if not file_has_data:
+            self._writer.writeheader()
+            self._file.flush()
 
     def write_rows(self, rows: list):
         for row in rows:
@@ -304,8 +334,11 @@ async def human_scroll(page: Page, min_delay: float, max_delay: float):
 # Alur utama
 # ---------------------------------------------------------------------------
 async def run_scraper(config: ScraperConfig) -> list:
-    tweets_data: list = []
-    scraped_ids: set = set()
+    scraped_ids: set = load_existing_ids(config.output_csv)
+    if scraped_ids:
+        log.info(f"[*] Ditemukan {len(scraped_ids)} tweet lama di {config.output_csv} - "
+                 f"disambung, bukan ditimpa.")
+    tweets_data: list = []  # tweet baru yang didapat proses (sesi) ini saja
 
     browser_path = find_browser_executable(config.browser_path)
     if config.browser_path and not browser_path:
@@ -344,130 +377,155 @@ async def run_scraper(config: ScraperConfig) -> list:
             # Mode: post spesifik (mengabaikan --query sepenuhnya)
             url = config.tweet_url if config.tweet_url.startswith("http") \
                 else f"https://x.com/i/web/status/{config.tweet_url}"
-            log.info(f"[*] Membuka postingan: {url}")
         else:
             encoded_query = urllib.parse.quote_plus(config.query)
             filter_param = "&f=live" if config.search_filter == "live" else ""
             url = f"https://x.com/search?q={encoded_query}{filter_param}"
-            log.info(f"[*] Membuka pencarian: {url}")
-        try:
-            await page.goto(url, timeout=30000)
-        except Exception as e:
-            log.error(f"[!] Gagal membuka halaman: {e}")
-            await context.close()
-            return tweets_data
-
-        log.info("[!] Kalau belum login, silakan login manual di jendela browser yang terbuka.")
-        log.info("[*] Menunggu tweet pertama muncul...")
-
-        try:
-            await page.wait_for_selector('[data-testid="tweet"]', timeout=30000)
-        except Exception:
-            log.error(
-                "[!] Tidak ada tweet yang termuat dalam 30 detik. Kemungkinan: belum login, "
-                "query tidak menghasilkan apa-apa, atau X sedang menampilkan halaman "
-                "verifikasi/rate-limit."
-            )
-            blocker = await check_for_blockers(page)
-            if blocker:
-                log.error(f"[!] Terdeteksi kondisi: {blocker}")
-            await context.close()
-            return tweets_data
-
-        # jeda singkat, seolah pengguna baru selesai membaca tweet pertama
-        await page.wait_for_timeout(int(random.uniform(1500, 3000)))
-
-        if config.tweet_url and config.reply_sort:
-            await try_set_reply_sort(page, config.reply_sort)
 
         writer = IncrementalCsvWriter(config.output_csv, CSV_FIELDS)
-        idle_counter = 0
-        total_scrolls = 0
-        start_time = time.perf_counter()
-        stop_reason = "target tercapai"
+        cycle_num = 0
+        overall_start = time.perf_counter()
 
+        # Untuk mengganti target (--query / --url), hentikan proses ini dengan Ctrl+C
+        # lalu jalankan lagi dengan argumen baru - data lama di --output tidak akan hilang.
         try:
             while True:
-                if len(tweets_data) >= config.limit:
-                    stop_reason = f"target {config.limit} tweet tercapai"
+                cycle_num += 1
+                if config.max_cycles and cycle_num > config.max_cycles:
+                    log.info(f"[*] Mencapai batas --max-cycles ({config.max_cycles}), berhenti.")
                     break
-                if idle_counter >= config.max_idle_scrolls:
-                    stop_reason = (f"tidak ada tweet baru setelah {config.max_idle_scrolls}x scroll "
-                                   f"berturut-turut (kemungkinan feed sudah habis untuk query ini)")
-                    break
-                if total_scrolls >= config.max_total_scrolls:
-                    stop_reason = f"mencapai batas keamanan {config.max_total_scrolls}x scroll"
-                    break
+                log.info(f"\n===== Siklus #{cycle_num}: {url} =====")
 
-                elements = await page.query_selector_all('[data-testid="tweet"]')
-                new_rows = []
+                try:
+                    await page.goto(url, timeout=30000)
+                except Exception as e:
+                    log.error(f"[!] Gagal membuka halaman: {e}. Coba lagi dalam 30 detik...")
+                    await asyncio.sleep(30)
+                    continue
 
-                for element in elements:
-                    if len(tweets_data) >= config.limit:
-                        break
-                    parsed = await extract_tweet(element)
-                    if not parsed or parsed["id"] in scraped_ids:
-                        continue
-                    if config.exclude_retweets and parsed["is_retweet"]:
-                        scraped_ids.add(parsed["id"])  # tetap tandai biar tidak dicek ulang
-                        continue
+                if cycle_num == 1:
+                    log.info("[!] Kalau belum login, silakan login manual di jendela browser yang terbuka.")
+                log.info("[*] Menunggu tweet pertama muncul...")
 
-                    scraped_ids.add(parsed["id"])
-                    tweets_data.append(parsed)
-                    new_rows.append(parsed)
-                    log.info(f"[{len(tweets_data)}/{config.limit}] @{parsed['handle']}: {parsed['text'][:60]}...")
-
-                if new_rows:
-                    writer.write_rows(new_rows)
-                    idle_counter = 0
-                else:
-                    idle_counter += 1
-                    log.info(f"[*] Tidak ada tweet baru di scroll ini ({idle_counter}/{config.max_idle_scrolls})...")
-
-                if len(tweets_data) >= config.limit:
-                    continue  # loop top will catch this and set stop_reason
-
-                total_scrolls += 1
-                if total_scrolls % 5 == 0:
+                try:
+                    await page.wait_for_selector('[data-testid="tweet"]', timeout=30000)
+                except Exception:
+                    log.error(
+                        "[!] Tidak ada tweet yang termuat dalam 30 detik. Kemungkinan: belum login, "
+                        "tidak ada hasil baru, atau X menampilkan halaman verifikasi/rate-limit."
+                    )
                     blocker = await check_for_blockers(page)
-                    if blocker == "rate_limited":
-                        stop_reason = "terdeteksi rate limit dari X - berhenti lebih awal untuk aman"
-                        break
-                    if blocker == "challenge":
-                        log.warning("[!] X meminta verifikasi identitas di jendela browser. "
-                                    "Browser TIDAK akan ditutup otomatis.")
-                        await asyncio.to_thread(
-                            input,
-                            "    Selesaikan verifikasi di jendela browser, lalu tekan ENTER di sini "
-                            "untuk lanjut scraping (Ctrl+C untuk berhenti total)... ",
-                        )
-                        log.info("[*] Melanjutkan scraping...")
-                        continue
-                    if blocker == "error_page":
-                        log.warning("[!] Halaman menampilkan error. Mencoba reload...")
-                        await page.reload()
-                        await page.wait_for_timeout(3000)
+                    if blocker:
+                        log.error(f"[!] Terdeteksi kondisi: {blocker}")
+                    log.info("[*] Menunggu 60 detik, lalu coba siklus berikutnya...")
+                    await asyncio.sleep(60)
+                    continue
 
-                await human_scroll(page, config.min_delay, config.max_delay)
+                await page.wait_for_timeout(int(random.uniform(1500, 3000)))
+
+                if config.tweet_url and config.reply_sort:
+                    await try_set_reply_sort(page, config.reply_sort)
+
+                idle_counter = 0
+                total_scrolls = 0
+                cycle_new = 0
+                cycle_start = time.perf_counter()
+                stop_reason = "target tercapai"
+
+                while True:
+                    if cycle_new >= config.limit:
+                        stop_reason = f"target {config.limit} tweet baru tercapai"
+                        break
+                    if idle_counter >= config.max_idle_scrolls:
+                        stop_reason = (f"tidak ada tweet baru setelah {config.max_idle_scrolls}x scroll "
+                                       f"(feed kemungkinan sudah habis untuk saat ini)")
+                        break
+                    if total_scrolls >= config.max_total_scrolls:
+                        stop_reason = f"mencapai batas keamanan {config.max_total_scrolls}x scroll"
+                        break
+
+                    elements = await page.query_selector_all('[data-testid="tweet"]')
+                    new_rows = []
+
+                    for element in elements:
+                        if cycle_new >= config.limit:
+                            break
+                        parsed = await extract_tweet(element)
+                        if not parsed or parsed["id"] in scraped_ids:
+                            continue
+                        if config.exclude_retweets and parsed["is_retweet"]:
+                            scraped_ids.add(parsed["id"])  # tetap tandai biar tidak dicek ulang
+                            continue
+
+                        scraped_ids.add(parsed["id"])
+                        tweets_data.append(parsed)
+                        new_rows.append(parsed)
+                        cycle_new += 1
+                        log.info(f"[siklus {cycle_num} | {cycle_new}/{config.limit}] "
+                                 f"@{parsed['handle']}: {parsed['text'][:60]}...")
+
+                    if new_rows:
+                        writer.write_rows(new_rows)
+                        idle_counter = 0
+                    else:
+                        idle_counter += 1
+                        log.info(f"[*] Tidak ada tweet baru di scroll ini "
+                                 f"({idle_counter}/{config.max_idle_scrolls})...")
+
+                    if cycle_new >= config.limit:
+                        continue  # loop top akan menangkap ini dan set stop_reason
+
+                    total_scrolls += 1
+                    if total_scrolls % 5 == 0:
+                        blocker = await check_for_blockers(page)
+                        if blocker == "rate_limited":
+                            stop_reason = "terdeteksi rate limit dari X - berhenti lebih awal untuk aman"
+                            break
+                        if blocker == "challenge":
+                            log.warning("[!] X meminta verifikasi identitas di jendela browser. "
+                                        "Browser TIDAK akan ditutup otomatis.")
+                            await asyncio.to_thread(
+                                input,
+                                "    Selesaikan verifikasi di jendela browser, lalu tekan ENTER di sini "
+                                "untuk lanjut scraping (Ctrl+C untuk berhenti total)... ",
+                            )
+                            log.info("[*] Melanjutkan scraping...")
+                            continue
+                        if blocker == "error_page":
+                            log.warning("[!] Halaman menampilkan error. Mencoba reload...")
+                            await page.reload()
+                            await page.wait_for_timeout(3000)
+
+                    await human_scroll(page, config.min_delay, config.max_delay)
+
+                cycle_elapsed = time.perf_counter() - cycle_start
+                log.info(f"[*] Siklus #{cycle_num} berhenti karena: {stop_reason}")
+                log.info(f"[+] +{cycle_new} tweet baru siklus ini ({cycle_elapsed:.1f} detik). "
+                         f"Total sesi ini: {len(tweets_data)} tweet baru, {len(scraped_ids)} id unik "
+                         f"sepanjang waktu, tersimpan di {config.output_csv}.")
+
+                if config.once:
+                    break
+
+                pause_s = random.uniform(config.cycle_pause_min, config.cycle_pause_max)
+                if "rate limit" in stop_reason.lower():
+                    pause_s *= 3  # kena rate limit -> mundur lebih jauh dari biasanya, bukan cuma jeda standar
+                    log.warning(f"[!] Karena kena rate limit, jeda dilipatgandakan jadi {pause_s / 60:.1f} menit.")
+                log.info(f"[*] Jeda {pause_s / 60:.1f} menit sebelum siklus berikutnya "
+                         f"(Ctrl+C untuk berhenti & tutup browser)...")
+                await asyncio.sleep(pause_s)
 
         except KeyboardInterrupt:
-            stop_reason = "dihentikan manual (Ctrl+C)"
-        except Exception as e:
-            stop_reason = f"error tak terduga: {e}"
-            log.exception("[!] Terjadi error saat scraping. Data yang sudah terkumpul tetap disimpan.")
+            log.warning("[!] Dihentikan manual (Ctrl+C).")
+        except Exception:
+            log.exception("[!] Error tak terduga. Data yang sudah terkumpul tetap tersimpan.")
         finally:
             writer.close()
 
-        elapsed = time.perf_counter() - start_time
-        log.info(f"[*] Berhenti karena: {stop_reason}")
-        log.info(f"[+] {len(tweets_data)} tweet tersimpan ke {config.output_csv} "
-                 f"({elapsed:.1f} detik, {len(scraped_ids)} id unik dilihat).")
-
-        if not config.headless:
-            try:
-                await asyncio.to_thread(input, "\n    Tekan ENTER untuk menutup browser... ")
-            except Exception:
-                pass
+        overall_elapsed = time.perf_counter() - overall_start
+        log.info(f"[+] Selesai. Total {len(tweets_data)} tweet baru ditambahkan sesi ini ke "
+                 f"{config.output_csv} ({overall_elapsed / 60:.1f} menit, "
+                 f"{len(scraped_ids)} id unik sepanjang waktu).")
 
         try:
             await context.close()
@@ -476,9 +534,15 @@ async def run_scraper(config: ScraperConfig) -> list:
 
         if config.also_json:
             json_path = str(Path(config.output_csv).with_suffix(".json"))
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(tweets_data, f, ensure_ascii=False, indent=2)
-            log.info(f"[+] Juga disimpan sebagai {json_path}")
+            try:
+                with open(config.output_csv, "r", encoding="utf-8-sig", newline="") as f:
+                    all_rows = list(csv.DictReader(f))
+                with open(json_path, "w", encoding="utf-8") as f:
+                    json.dump(all_rows, f, ensure_ascii=False, indent=2)
+                log.info(f"[+] Seluruh data ({len(all_rows)} baris, semua sesi) "
+                         f"juga diekspor sebagai {json_path}")
+            except Exception as e:
+                log.warning(f"[!] Gagal membuat export JSON: {e}")
 
     return tweets_data
 
@@ -514,6 +578,15 @@ def parse_args() -> ScraperConfig:
     parser.add_argument("--exclude-retweets", action="store_true", help="Lewati tweet yang merupakan repost")
     parser.add_argument("--stealth", action="store_true",
                         help="Aktifkan playwright-stealth (patch fingerprint dasar, opsional)")
+    parser.add_argument("--once", action="store_true",
+                        help="Berhenti & tutup browser setelah 1 siklus (perilaku lama). Default: jalan terus "
+                             "(kontinu) sampai Ctrl+C.")
+    parser.add_argument("--cycle-pause-min", type=float, default=180.0,
+                        help="Jeda MINIMUM antar siklus, dalam detik (default: 180 = 3 menit)")
+    parser.add_argument("--cycle-pause-max", type=float, default=420.0,
+                        help="Jeda MAKSIMUM antar siklus, dalam detik (default: 420 = 7 menit)")
+    parser.add_argument("--max-cycles", type=int, default=0,
+                        help="Batas jumlah siklus untuk keperluan tes (default: 0 = tanpa batas)")
     args = parser.parse_args()
 
     return ScraperConfig(
@@ -532,6 +605,10 @@ def parse_args() -> ScraperConfig:
         stealth=args.stealth,
         tweet_url=args.tweet_url,
         reply_sort=args.reply_sort,
+        once=args.once,
+        cycle_pause_min=args.cycle_pause_min,
+        cycle_pause_max=args.cycle_pause_max,
+        max_cycles=args.max_cycles,
     )
 
 
